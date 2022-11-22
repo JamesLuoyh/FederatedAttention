@@ -55,9 +55,13 @@ class EMNISTNet(nn.Module):
         self.dropout_2 = nn.Dropout(0.5)
         self.linear_2 = nn.Linear(128, 10 if only_digits else 62)
         self.relu = nn.ReLU()
+        torch.nn.init.xavier_normal_(self.conv2d_1.weight)
+        torch.nn.init.xavier_normal_(self.conv2d_2.weight)
+        torch.nn.init.xavier_normal_(self.linear_1.weight)
+        torch.nn.init.xavier_normal_(self.linear_2.weight)
 
     def forward(self, x):
-        x = torch.squeeze(x)
+        x = torch.squeeze(x, -1)
         x = torch.unsqueeze(x, 1)
         x = self.conv2d_1(x)
         x = self.relu(x)
@@ -67,7 +71,8 @@ class EMNISTNet(nn.Module):
         x = self.dropout_1(x)
         x = self.flatten(x)
         x = self.linear_1(x)
+        z = torch.clone(x)
         x = self.relu(x)
         x = self.dropout_2(x)
         x = self.linear_2(x)
-        return x
+        return x, z
