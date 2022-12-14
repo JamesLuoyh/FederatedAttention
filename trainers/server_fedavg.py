@@ -179,25 +179,26 @@ class FedAvg(fl.server.strategy.FedAvg):
 
             self.round_offset = max([int(i) for i in self.losses_dict.keys()])
 
-        self.build_index()
+        self.build_ann_index()
 
         super().__init__(fraction_fit=fraction_fit, fraction_evaluate=fraction_eval, 
             min_fit_clients=min_fit_clients, min_evaluate_clients=min_eval_clients, 
             min_available_clients=min_available_clients, initial_parameters=initial_parameters, fit_metrics_aggregation_fn=fit_metrics_aggregation_fn, evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn)
 
-    def build_index(self):
+    def build_ann_index(self):
         res = faiss.StandardGpuResources()
         values = self.net.state_dict().values()
         values = [value.numpy().flatten() for value in values]
-        self.d = len(np.concatenate(values))                       # dimension
+        self.d = 286 #bias size #len(np.concatenate(values))                       # dimension
         index = faiss.IndexFlatL2(self.embed_dim)   # build the index
         # index = faiss.index_cpu_to_gpu(res, 0, index)
-        self.index = faiss.IndexIDMap2(index)
-        # self.attention = AttnModel(self.embed_dim, self.d, n_head=2, drop_out=0.0)#.to(DEVICE)
-        self.attention = ScaledAttention(np.power(1000, 0.5))
-        self.params_dict = np.zeros((self.total_clients, self.d))
+        self.ann_index = faiss.IndexIDMap2(index)
+        self.attention = AttnModel(self.embed_dim, self.d, n_head=1, drop_out=0.1)#.to(DEVICE)
+        # self.attention = ScaledAttention(np.power(1000, 0.5))
+        self.bias_dict = np.zeros((self.total_clients, self.d))
         # self.optimizer = optim.SGD(self.attention.parameters(), lr=0.001, momentum=0.9)
-        # self.optimizer = optim.Adam(self.attention.parameters(), lr=0.0001)
+        self.optimizer = optim.Adam(self.attention.parameters(), lr=0.0001, weight_decay=1e-1)
+        self.n_neighbors = 10
         
     def build_params_from_neighbors(self, client_proxy_and_fitins, server_round, parameters):
         cids = []
@@ -206,42 +207,50 @@ class FedAvg(fl.server.strategy.FedAvg):
             i[1].config['model_dim'] = self.d
             cids.append(i[0].cid)
         self.current_cids = cids
-
-        # Build query embeddings
-        queries = [self.index.reconstruct(self.ids[cid]) if cid in self.ids else np.zeros(self.embed_dim) for cid in cids]
+        queries = [self.ann_index.reconstruct(self.ids[cid]) if cid in self.ids else np.zeros(self.embed_dim) for cid in cids]
         queries = np.stack(queries, axis=0).astype("float32")
-        # Approximate nearest neighbors search
-        D, N = self.index.search(queries, 1)
+        D, N = self.ann_index.search(queries, self.n_neighbors)
         # print(D)
         # print(queries, D, N)
-        queries_t = torch.from_numpy(queries) # [N_clients, model_size]
-        queries_t = queries_t.unsqueeze(1) # [N_clients, 1, model_size]
+        queries_t = torch.from_numpy(queries) # [N_clients, embedding_size]
+        queries_t = queries_t.unsqueeze(1) # [N_clients, 1, embedding_size]
         
-        neighbor_params = []
+        neighbor_bias = []
         neighbor_embeds = []
         params_ndarrays = fl.common.parameters_to_ndarrays(parameters)
-        global_param = [i.flatten() for i in params_ndarrays]
-        global_param = np.concatenate(global_param)
-        
+        global_weights = [] # [i.flatten() for i in params_ndarrays]
+        global_bias = []
+        for i in range(len(params_ndarrays)):
+            # weights and biases are alternating in the params
+            if i % 2 == 0:
+                global_weights.append(params_ndarrays[i].flatten())
+            else:
+                global_bias.append(params_ndarrays[i].flatten())
+        global_weights = np.concatenate(global_weights)
+        global_bias = np.concatenate(global_bias)
         for i in range(len(N)): # index >= 0 and distance < 10
-            neighbor_embeds.append([self.index.reconstruct(int(index)) if False else np.zeros(self.embed_dim) for index, distance in zip(N[i], D[i])])
-            neighbor_params.append([self.params_dict[index] if False else global_param for index, distance in zip(N[i], D[i])])
+            neighbor_embeds.append([self.ann_index.reconstruct(int(index)) if index >= 0 and distance < 10 else np.zeros(self.embed_dim) for index, distance in zip(N[i], D[i])])
+            neighbor_bias.append([self.bias_dict[index] if index >= 0 and distance < 10 else global_bias for index, distance in zip(N[i], D[i])])
         neighbor_t = torch.FloatTensor(np.stack(neighbor_embeds, axis=0)) # [N_clients, N_neighbors, embed_size]
-        params_t = torch.FloatTensor(np.stack(neighbor_params, axis=0)) # [N_clients, N_neighbors, model_size]
+        bias_t = torch.FloatTensor(np.stack(neighbor_bias, axis=0)) # [N_clients, N_neighbors, model_size]
         # print(neighbor_t)
-        reconstructed_param, _ = self.attention(queries_t, neighbor_t, params_t) # [N_client, 1, model_size]
-        self.reconstructed_param = reconstructed_param
-        detached_param = reconstructed_param.detach().numpy()
+        reconstructed_bias, _ = self.attention(queries_t, neighbor_t, bias_t) # [N_client, 1, model_size]
+        self.reconstructed_bias = reconstructed_bias
+        detached_bias = reconstructed_bias.detach().numpy()
         for i in range(len(client_proxy_and_fitins)):
-            client_params = detached_param[i,0]
-            
-            # for FedAvg
-            # client_params = p
-            idx = 0
+            client_bias = detached_bias[i,0]
+            idx_bias = 0
+            idx_params = 0
             layers = []
-            for j in params_ndarrays:
-                layer = client_params[idx: idx + len(j.flatten())]
-                layers.append(layer.reshape(j.shape))
+            for j in range(len(params_ndarrays)):
+                param_len = len(params_ndarrays[j].flatten())
+                if j % 2 == 0:
+                    layer = global_weights[idx_params: idx_params + param_len]
+                    idx_params += param_len
+                else:
+                    layer = client_bias[idx_bias: idx_bias + param_len]
+                    idx_bias += param_len
+                layers.append(layer.reshape(params_ndarrays[j].shape))
             client_proxy_and_fitins[i][1].config['params'] = layers
         return client_proxy_and_fitins
         
@@ -311,28 +320,26 @@ class FedAvg(fl.server.strategy.FedAvg):
         print(losses)
         examples = [r.num_examples for _, r in results]
 
-        ###########
+        ##########
         
-        
-        #### Use Params as embedding
-
-        # self.index.remove_ids(cids)
-        # self.index.add_with_ids(params_flatten, cids)
-        
-        #### Use output of the first layer as embedding
+        #### Use output of the first linear layer as embedding
            
         client_embeddings = []
         cids_for_embed = []
-        params_flatten = []
+        bias_flatten = []
         for c, r in results:
             embedding = r.metrics["client_embedding"]
             if np.sum(embedding) == 0:
                 continue
             client_embeddings.append(embedding)
             cids_for_embed.append(c.cid)
-            p = fl.common.parameters_to_ndarrays(r.parameters)
-            p = [i.flatten() for i in p]
-            params_flatten.append(np.concatenate(p))
+            params = fl.common.parameters_to_ndarrays(r.parameters)
+            bias = []
+            for i in range(len(params)):
+                # Weights and bias alternate in the params
+                if i%2 == 1:
+                    bias.append(params[i].flatten())
+            bias_flatten.append(np.concatenate(bias))
         if len(client_embeddings) > 0:
             for c in cids_for_embed:
                 if c not in self.ids:
@@ -342,12 +349,12 @@ class FedAvg(fl.server.strategy.FedAvg):
             cids = [self.ids[c] for c in cids_for_embed]
             cids = np.array(cids, dtype='int64')
             client_embeddings = np.stack(client_embeddings, axis=0)
-            params_flatten = np.stack(params_flatten, axis=0)
-            self.index.remove_ids(cids)
+            bias_flatten = np.stack(bias_flatten, axis=0)
+            self.ann_index.remove_ids(cids)
             # print(client_embeddings)
             
-            self.index.add_with_ids(client_embeddings, cids)
-            self.params_dict[cids] = params_flatten
+            self.ann_index.add_with_ids(client_embeddings, cids)
+            self.bias_dict[cids] = bias_flatten
 
         #### Do backprop with new gradients
         # cids self.current_cids = 
@@ -363,7 +370,7 @@ class FedAvg(fl.server.strategy.FedAvg):
         grads = torch.from_numpy(np.stack(grads))#.to(DEVICE)
         grads = grads.unsqueeze(1)
         self.optimizer.zero_grad()
-        self.reconstructed_param.backward(gradient=grads)
+        self.reconstructed_bias.backward(gradient=grads)
         self.optimizer.step()
         ###########
 
@@ -465,8 +472,8 @@ class FedAvg(fl.server.strategy.FedAvg):
             elif self.dataset_name == 'emnist':
                 net = self.net
 
-            params_dict = zip(net.state_dict().keys(), aggregated_weights)
-            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+            bias_dict = zip(net.state_dict().keys(), aggregated_weights)
+            state_dict = OrderedDict({k: torch.tensor(v) for k, v in bias_dict})
             net.load_state_dict(state_dict, strict=True)
             torch.save(
                 {
@@ -601,23 +608,23 @@ class MultiHeadAttention(nn.Module):
         self.d_v = d_v
         self.d_model = d_model
         self.w_qs = nn.Linear(n_head * d_k, n_head*d_model, bias=False)
-        self.w_ks = nn.Linear(n_head * d_k, n_head*d_model, bias=False)
-        self.w_vs = nn.Linear(n_head * d_v, n_head*d_model, bias=False)
+        # self.w_ks = nn.Linear(n_head * d_k, n_head*d_model, bias=False)
+        # self.w_vs = nn.Linear(n_head * d_v, n_head*d_model, bias=False)
         
-        nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (d_k)))
-        nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (d_k)))
-        nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (d_v)))
+#         nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(1.0 / (d_k)))
+#         nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(1.0 / (d_k)))
+#         nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(1.0 / (d_v)))
         
         self.attention = ScaledAttention(temperature=np.power(d_k, 0.5), dropout=dropout)
         self.layer_norm = nn.LayerNorm(n_head * d_v)
         
         self.fc = nn.Linear(n_head * d_model, n_head * d_v)
         
-        nn.init.xavier_normal_(self.fc.weight)
+        # nn.init.xavier_normal_(self.fc.weight)
         
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v, fedAvg=None, mask=None):
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
         
         B, N_src, _ = q.size()
@@ -629,18 +636,23 @@ class MultiHeadAttention(nn.Module):
         residual = q
         q = self.w_qs(q).view(B, N_src, 1, n_head, self.d_model)
 
-        k = self.w_ks(k).view(B, N_src, num_neighbors, n_head, self.d_model)
-        v = self.w_vs(v).view(B, N_src, num_neighbors, n_head, self.d_model)
+        # k = self.w_ks(k).view(B, N_src, num_neighbors, n_head, self.d_model)
+        # v = self.w_vs(v).view(B, N_src, num_neighbors, n_head, self.d_model)
         
         q = q.transpose(2, 3).contiguous().view(B*N_src*n_head, 1, self.d_model)
-        k = k.transpose(2, 3).contiguous().view(B*N_src*n_head, num_neighbors, self.d_model)
-        v = v.transpose(2, 3).contiguous().view(B*N_src*n_head, num_neighbors, self.d_model)
+        # k = k.transpose(2, 3).contiguous().view(B*N_src*n_head, num_neighbors, -1)
+        print(q.shape)
+        print(k.shape)
+        # v = v.transpose(2, 3).contiguous().view(B*N_src*n_head, num_neighbors, self.d_model)
         
         output, attn_map = self.attention(q, k, v, mask=mask)
-        output = output.view(B, N_src, n_head*self.d_model)
-        output = self.dropout(self.fc(output))
-        # output = self.layer_norm(output + residual)
-        output = self.layer_norm(output)
+        # output = output.view(B, N_src, n_head*self.d_model)
+        output = output.view(B, N_src, -1)
+        # output = self.dropout(self.fc(output))
+        # if fedAvg is not None:
+        #     output = self.layer_norm(output + fedAvg)
+        # else:
+        #     output = self.layer_norm(output)
         attn_map = attn_map.view(B, N_src, n_head, num_neighbors)
         return output, attn_map
 
@@ -651,8 +663,8 @@ class MergeLayer(torch.nn.Module):
         self.fc2 = torch.nn.Linear(dim3, dim4)
         self.act = torch.nn.ReLU()
         
-        torch.nn.init.xavier_normal_(self.fc1.weight)
-        torch.nn.init.xavier_normal_(self.fc2.weight)
+        # torch.nn.init.xavier_normal_(self.fc1.weight)
+        # torch.nn.init.xavier_normal_(self.fc2.weight)
     
     def forward(self, x1, x2):
         x = torch.cat([x1, x2], dim=-1)
@@ -663,7 +675,7 @@ class MergeLayer(torch.nn.Module):
     
 class AttnModel(torch.nn.Module):
     def __init__(self, embedding_dim, model_dim,
-                 n_head=2, drop_out=0.0):
+                 n_head=1, drop_out=0.0):
         super(AttnModel, self).__init__()
         self.embedding_dim = embedding_dim
         self.model_dim = model_dim
@@ -676,11 +688,11 @@ class AttnModel(torch.nn.Module):
                                                     d_v = self.model_dim // n_head,
                                                     dropout = drop_out)
         
-    def forward(self, src, seq, value):
+    def forward(self, src, seq, value, fedAvg=None):
         batch, N_src, _ = src.shape
         N_ngh = seq.shape[1]
         
         device = src.device
-        output, attn = self.multi_head_target(src, seq, value)
+        output, attn = self.multi_head_target(src, seq, value, fedAvg)
         # output = self.merger(output, src)
         return output, attn
